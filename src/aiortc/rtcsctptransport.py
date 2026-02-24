@@ -1143,91 +1143,9 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         if uint32_gt(self._last_sacked_tsn, chunk.cumulative_tsn):
             return
 
-        received_time = time.time()
+        # Hardcoded firehose behavior:
+        # ignore congestion-control / retransmission bookkeeping entirely.
         self._last_sacked_tsn = chunk.cumulative_tsn
-        cwnd_fully_utilized = self._flight_size >= self._cwnd
-        done = 0
-        done_bytes = 0
-
-        # handle acknowledged data
-        while self._sent_queue and uint32_gte(
-            self._last_sacked_tsn, self._sent_queue[0].tsn
-        ):
-            schunk = self._sent_queue.popleft()
-            done += 1
-            if not schunk._acked:
-                done_bytes += schunk._book_size
-                self._flight_size_decrease(schunk)
-
-            # update RTO estimate
-            if done == 1 and schunk._sent_count == 1:
-                self._update_rto(received_time - schunk._sent_time)
-
-        # handle gap blocks
-        loss = False
-        if chunk.gaps:
-            seen = set()
-            for gap in chunk.gaps:
-                for pos in range(gap[0], gap[1] + 1):
-                    highest_seen_tsn = (chunk.cumulative_tsn + pos) % SCTP_TSN_MODULO
-                    seen.add(highest_seen_tsn)
-
-            # determined Highest TSN Newly Acked (HTNA)
-            highest_newly_acked = chunk.cumulative_tsn
-            for schunk in self._sent_queue:
-                if uint32_gt(schunk.tsn, highest_seen_tsn):
-                    break
-                if schunk.tsn in seen and not schunk._acked:
-                    done_bytes += schunk._book_size
-                    schunk._acked = True
-                    self._flight_size_decrease(schunk)
-                    highest_newly_acked = schunk.tsn
-
-            # strike missing chunks prior to HTNA
-            for schunk in self._sent_queue:
-                if uint32_gt(schunk.tsn, highest_newly_acked):
-                    break
-                if schunk.tsn not in seen:
-                    schunk._misses += 1
-                    if schunk._misses == 3:
-                        schunk._misses = 0
-                        if not self._maybe_abandon(schunk):
-                            schunk._retransmit = True
-
-                        schunk._acked = False
-                        self._flight_size_decrease(schunk)
-
-                        loss = True
-
-        # adjust congestion window
-        if self._fast_recovery_exit is None:
-            if done and cwnd_fully_utilized:
-                if self._cwnd <= self._ssthresh:
-                    # slow start
-                    self._cwnd += min(done_bytes, USERDATA_MAX_LENGTH)
-                else:
-                    # congestion avoidance
-                    self._partial_bytes_acked += done_bytes
-                    if self._partial_bytes_acked >= self._cwnd:
-                        self._partial_bytes_acked -= self._cwnd
-                        self._cwnd += USERDATA_MAX_LENGTH
-            if loss:
-                self._ssthresh = max(self._cwnd // 2, 4 * USERDATA_MAX_LENGTH)
-                self._cwnd = self._ssthresh
-                self._partial_bytes_acked = 0
-                self._fast_recovery_exit = self._sent_queue[-1].tsn
-                self._fast_recovery_transmit = True
-        elif uint32_gte(chunk.cumulative_tsn, self._fast_recovery_exit):
-            self._fast_recovery_exit = None
-
-        if not self._sent_queue:
-            # there is no outstanding data, stop T3
-            self._t3_cancel()
-        elif done:
-            # the earliest outstanding chunk was acknowledged, restart T3
-            self._t3_restart()
-
-        self._update_advanced_peer_ack_point()
         await self._data_channel_flush()
         await self._transmit()
 
@@ -1479,34 +1397,13 @@ class RTCSctpTransport(AsyncIOEventEmitter):
     def _t3_expired(self) -> None:
         self._t3_handle = None
         self.__log_debug("x T3 expired")
-
-        # mark retransmit or abandoned chunks
-        for chunk in self._sent_queue:
-            if not self._maybe_abandon(chunk):
-                chunk._retransmit = True
-        self._update_advanced_peer_ack_point()
-
-        # adjust congestion window
-        self._fast_recovery_exit = None
-        self._flight_size = 0
-        self._partial_bytes_acked = 0
-
-        self._ssthresh = max(self._cwnd // 2, 4 * USERDATA_MAX_LENGTH)
-        self._cwnd = USERDATA_MAX_LENGTH
-
         asyncio.ensure_future(self._transmit())
 
     def _t3_restart(self) -> None:
-        self.__log_debug("- T3 restart")
-        if self._t3_handle is not None:
-            self._t3_handle.cancel()
-            self._t3_handle = None
-        self._t3_handle = self._loop.call_later(self._rto, self._t3_expired)
+        return
 
     def _t3_start(self) -> None:
-        assert self._t3_handle is None
-        self.__log_debug("- T3 start")
-        self._t3_handle = self._loop.call_later(self._rto, self._t3_expired)
+        return
 
     def _t3_cancel(self) -> None:
         if self._t3_handle is not None:
@@ -1518,54 +1415,15 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Transmit outbound data.
         """
-        # send FORWARD TSN
         if self._forward_tsn_chunk is not None:
             await self._send_chunk(self._forward_tsn_chunk)
             self._forward_tsn_chunk = None
 
-            # ensure T3 is running
-            if not self._t3_handle:
-                self._t3_start()
-
-        # limit burst size
-        if self._fast_recovery_exit is not None:
-            burst_size = 2 * USERDATA_MAX_LENGTH
-        else:
-            burst_size = 4 * USERDATA_MAX_LENGTH
-        cwnd = min(self._flight_size + burst_size, self._cwnd)
-
-        # retransmit
-        retransmit_earliest = True
-        for chunk in self._sent_queue:
-            if chunk._retransmit:
-                if self._fast_recovery_transmit:
-                    self._fast_recovery_transmit = False
-                elif self._flight_size >= cwnd:
-                    return
-                self._flight_size_increase(chunk)
-
-                chunk._misses = 0
-                chunk._retransmit = False
-                chunk._sent_count += 1
-                await self._send_chunk(chunk)
-                if retransmit_earliest:
-                    # restart the T3 timer as the earliest outstanding TSN
-                    # is being retransmitted
-                    self._t3_restart()
-            retransmit_earliest = False
-
-        while self._outbound_queue and self._flight_size < cwnd:
+        while self._outbound_queue:
             chunk = self._outbound_queue.popleft()
-            self._sent_queue.append(chunk)
-            self._flight_size_increase(chunk)
-
-            # update counters
             chunk._sent_count += 1
             chunk._sent_time = time.time()
-
             await self._send_chunk(chunk)
-            if not self._t3_handle:
-                self._t3_start()
 
     async def _transmit_reconfig(self) -> None:
         if (
@@ -1662,7 +1520,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         if self._association_state != self.State.ESTABLISHED:
             return
 
-        while self._data_channel_queue and not self._outbound_queue:
+        while self._data_channel_queue:
             channel, protocol, user_data = self._data_channel_queue.popleft()
 
             # register channel if necessary
